@@ -64,6 +64,11 @@ class ToolParser:
     # ``VLLM_ENFORCE_STRICT_TOOL_CALLING=0`` still disables structural tags.
     default_tool_strict_level: ToolStrictLevel = ToolStrictLevel.AUTO
     engine_based_streaming: bool = False
+    # When True, streaming requests with tool_choice="none" still run through
+    # extract_tool_calls_streaming() and only the tool calls are dropped.
+    # Set it when the raw model text carries markup that only the tool parser
+    # strips (e.g. channel markers); otherwise "none" streams raw delta_text.
+    parse_content_when_tool_choice_none: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

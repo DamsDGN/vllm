@@ -356,6 +356,7 @@ def fused_moe_kernel(
     USE_TMA_B: tl.constexpr = False,
     USE_TMA_A: tl.constexpr = False,
     C_IS_SORTED: tl.constexpr = False,
+    FUSE_RELU2: tl.constexpr = False,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -613,6 +614,12 @@ def fused_moe_kernel(
     if HAS_BIAS:
         accumulator += bias[None, :]
 
+    # Non-gated relu^2 of the w13 output (RELU2_NO_MUL), on the fp32 accumulator:
+    # the activation kernel and its round trip through memory are skipped.
+    if FUSE_RELU2:
+        accumulator = tl.maximum(accumulator, 0.0)
+        accumulator = accumulator * accumulator
+
     # Router (MoE) weight multiplication:
     # This multiplication MUST be performed in float32 before any precision
     # conversion to ensure numerical stability, which is especially critical
@@ -815,6 +822,7 @@ def invoke_fused_moe_triton_kernel(
     B_bias: torch.Tensor | None = None,
     A_is_sorted: bool = False,
     C_is_sorted: bool = False,
+    fuse_relu2: bool = False,
 ):
     assert topk_weights is not None or not mul_routed_weight
     if topk_weights is not None and not topk_weights.is_contiguous():
@@ -987,6 +995,7 @@ def invoke_fused_moe_triton_kernel(
         USE_TMA_B=use_tma_b,
         USE_TMA_A=use_tma_a,
         C_IS_SORTED=C_is_sorted,
+        FUSE_RELU2=fuse_relu2,
         **config,
     )
 

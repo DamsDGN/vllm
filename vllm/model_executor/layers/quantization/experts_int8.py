@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.online.int8 import (
     Int8OnlineMoEMethod,
+    Int8SerializedMoEMethod,
 )
 
 
@@ -25,10 +26,15 @@ class ExpertsInt8Config(QuantizationConfig):
 
     Backward-compatible config for ``--quantization experts_int8``.
     Prefer ``--quantization int8_per_channel``
+
+    A checkpoint whose config carries ``quantization_config:
+    {"quant_method": "experts_int8"}`` already stores the int8 expert weights
+    and their per-row scales, as this method would have computed them.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, is_checkpoint_serialized: bool = False) -> None:
         super().__init__()
+        self.is_checkpoint_serialized = is_checkpoint_serialized
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -48,7 +54,7 @@ class ExpertsInt8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ExpertsInt8Config":
-        return cls()
+        return cls(is_checkpoint_serialized=config.get("quant_method") == "experts_int8")
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -56,5 +62,7 @@ class ExpertsInt8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
+            if self.is_checkpoint_serialized:
+                return Int8SerializedMoEMethod(moe=layer.moe_config)
             return Int8OnlineMoEMethod(moe=layer.moe_config)
         return None

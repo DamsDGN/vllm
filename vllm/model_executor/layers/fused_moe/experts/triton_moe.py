@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -64,6 +66,31 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+# OLALA_MOE_FUSE_RELU2=0: separate relu^2 activation kernel (A/B)
+_FUSE_RELU2 = os.environ.get("OLALA_MOE_FUSE_RELU2", "1") == "1"
+# Olala experts (int8 W8A16, relu^2, K=384, N=768) on sm8x: both GEMMs in one CUDA
+# kernel (olala/csrc/moe_relu2_int8_sm80.cu) from OLALA_MOE_CUDA_MIN_TOKENS tokens on.
+# Below that (decode batches) Triton stays: one CTA per 32-pair block leaves SMs idle when
+# few experts are hit (A4500, decode16/64: +0.4-0.5 ms/step with the CUDA kernel).
+_MOE_CUDA = os.environ.get("OLALA_MOE_CUDA", "1") == "1"
+_MOE_CUDA_MIN_TOKENS = int(os.environ.get("OLALA_MOE_CUDA_MIN_TOKENS", "128"))
+_MOE_CUDA_EXT = None
+
+
+def _moe_cuda_ext(device: torch.device):
+    global _MOE_CUDA_EXT
+    if _MOE_CUDA_EXT is None:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+        cc = "".join(map(str, torch.cuda.get_device_capability(device)))
+        _MOE_CUDA_EXT = load_extension(
+            "olala_moe_relu2_int8_sm80",
+            "moe_relu2_int8_sm80.cu",
+            ["-O3", "-std=c++20", "--use_fast_math",
+             f"-gencode=arch=compute_{cc},code=sm_{cc}"],
+        )
+    return _MOE_CUDA_EXT
 
 
 @triton.jit
@@ -395,6 +422,34 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 "router weights on the input nor LoRA."
             )
 
+        if (
+            _MOE_CUDA
+            and num_tokens >= _MOE_CUDA_MIN_TOKENS
+            and activation == MoEActivation.RELU2_NO_MUL
+            and self._lora_context is None
+            and not hooked
+            and expert_map is None  # single-rank only (no EP slot skipping)
+            and self.quant_config.use_int8_w8a16
+            and self.block_shape is None
+            and self.w1_bias is None
+            and self.w2_bias is None
+            and not apply_router_weight_on_input
+            and hidden_states.dtype == torch.bfloat16
+            and topk_weights.dtype == torch.float32
+            and (N, K) == (768, 384)
+            and torch.cuda.get_device_capability(hidden_states.device)[0] == 8
+        ):
+            sorted_ids, block_experts, n_padded = moe_align_block_size(
+                topk_ids, 32, global_num_experts, expert_map
+            )
+            _moe_cuda_ext(hidden_states.device).moe_relu2_int8(
+                hidden_states, w1, self.w1_scale, w2, self.w2_scale,
+                topk_weights.contiguous(), sorted_ids, block_experts, n_padded,
+                intermediate_cache3, top_k_num, True,
+            )
+            self.moe_sum(intermediate_cache3, output)
+            return
+
         # Under EP, drop the top-k slots routed to remote experts at alignment
         # time instead of launching `off_experts == -1` GEMM blocks that only
         # write zeros; the pad-aware `moe_sum` below skips the same slots.
@@ -522,11 +577,21 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             else (a1q_scale if a1q_scale is not None else self.a1_scale)
         )
 
+        # relu^2 (non-gated) applied in the w13 GEMM epilogue, straight into
+        # intermediate_cache2 (LoRA adds its w13 delta before the activation).
+        fuse_relu2 = (
+            _FUSE_RELU2
+            and activation == MoEActivation.RELU2_NO_MUL
+            and lora_context is None
+        )
+
         def _base_w13_fn():
             invoke_fused_moe_triton_kernel(
                 hidden_states,
                 w1,
-                intermediate_cache1,
+                intermediate_cache2.view(num_tokens, top_k_num, N)
+                if fuse_relu2
+                else intermediate_cache1,
                 input_scale,
                 self.w1_scale,
                 None,  # topk_weights
@@ -545,6 +610,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 block_shape=self.block_shape,
                 B_bias=self.w1_bias,
                 C_is_sorted=use_sorted_a,
+                fuse_relu2=fuse_relu2,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -610,6 +676,15 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # Fuse SiLU+Mul + FP8 block quantize into a single kernel
         # when conditions permit (gated SiLU, fp8 block quant with
         # group_size=128, no LoRA requiring the BF16 intermediate).
+        if fuse_relu2:
+            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                intermediate_cache2,
+                a2_scale,
+                self.quant_dtype,
+                self.per_act_token_quant,
+                self.block_shape,
+                quantization_emulation=self.quantization_emulation,
+            )
         # The fused kernel has no clamp parameter, so a configured
         # SwiGLU clamp limit falls through to the unfused path.
         if use_sorted_a:
