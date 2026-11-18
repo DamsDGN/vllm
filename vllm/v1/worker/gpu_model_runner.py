@@ -128,10 +128,14 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.olala_diff_tpa_attn import (
+    OlalaDiffTPAMetadataBuilder,
+)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.mamba3_attn import Mamba3AttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
@@ -2424,7 +2428,21 @@ class GPUModelRunner(
             cache_key = (kv_cache_spec, type(builder))
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(
+            if self.speculative_config is not None and isinstance(
+                builder,
+                (Mamba3AttentionMetadataBuilder, OlalaDiffTPAMetadataBuilder),
+            ):
+                # Olala's column-slot protocol needs last-step acceptance on
+                # EVERY step (including no-draft steps): the current state
+                # column is max(num_accepted - 1, 0), and a build without it
+                # would fall back to column 0 and read a stale state.
+                extra_attn_metadata_args = dict(
+                    num_accepted_tokens=self.num_accepted_tokens.gpu[
+                        :num_reqs_padded
+                    ],
+                    num_decode_draft_tokens_cpu=None,
+                )
+            elif use_spec_decode and isinstance(
                 builder,
                 (
                     Mamba2AttentionMetadataBuilder,

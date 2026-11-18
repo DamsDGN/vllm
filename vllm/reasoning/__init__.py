@@ -144,6 +144,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "nemotron_v3_engine_reasoning_parser",
         "NemotronV3ParserReasoningAdapter",
     ),
+    "olala": (
+        "olala_reasoning_parser",
+        "OlalaParser",
+    ),
     "olmo3": (
         "olmo3_reasoning_parser",
         "Olmo3ReasoningParser",

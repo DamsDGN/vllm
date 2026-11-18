@@ -1,4 +1,55 @@
 <!-- markdownlint-disable MD001 MD041 -->
+## Olala fork: environment variables
+
+This branch (`dragon-v0.26`) adds the Olala hybrid model (Mamba-3 MIMO + Differential TPA + latent MoE).
+Its kernels and fast paths are controlled by the variables below; every default is the tuned production setting.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OLALA_TPA_FACTOR` | `1` | TPA-factorized paged KV cache for the DiffTPA layers (stores the rank-4 factors, 2.5x smaller than dense K/V) with the wgmma decode-attention kernel. `0` = dense paged KV + standard attention backend. Not compatible with speculative decoding (use `0` with spec decode). |
+| `OLALA_MAMBA3_STEP` | `cuda` | Mamba-3 decode step: `cuda` = persistent CUDA kernel (bf16 and fp32 state); any other value = CuteDSL step (`ops/mamba3/step_cute.py`). |
+| `OLALA_GROUPED_PREFILL` | `1` | Group-parallel exact Mamba-3 varlen prefill for long prompts; `0` = single-pass kernel. |
+| `OLALA_GEMV` | `1` | Single-token Triton GEMV for decode projections; `0` = regular GEMM. |
+| `OLALA_TPA_CONCAT` | `1` | One GEMM over the concatenated DiffTPA input projections; `0` = separate projections. |
+| `OLALA_MOE_SMALL` | `1` | Small-batch latent-MoE decode path (gather-GEMV kernels); `0` = generic fused-MoE pipeline. |
+| `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
+| `OLALA_JIT_CUDA_HOME` | auto | CUDA toolkit used to JIT-build those extensions. Auto = torch's `CUDA_HOME` if its nvcc major matches `torch.version.cuda`, else the newest matching `/usr/local/cuda-<major>.*` (e.g. a cu128 torch on a host whose default toolkit is CUDA 13). Both kernels need an sm_90 GPU (H100/H200/GH200); elsewhere, or if the build fails, vLLM warns and falls back to dense KV + CuteDSL step. |
+| `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
+| `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
+
+Chunked prefill is on by default, as for any vLLM model (`OLALA_CHUNKED_PREFILL` is no longer read): it bounds
+the TTFT of long prompts. `--no-enable-chunked-prefill` keeps whole-prompt steps and the FULL-decode CUDA-graph
+regime (more throughput under concurrency on short prompts); `--max-num-batched-tokens` must then be at least
+`--max-model-len`.
+
+The Mamba-3 SSM state is stored in **fp32** by default (`--mamba-ssm-cache-dtype auto`): bf16 storage drifts over
+long generations (repetition loops). `--mamba-ssm-cache-dtype bfloat16` is ~15% faster at high concurrency.
+Checkpoints converted before the Olala rename (`DragonForCausalLM`) still load.
+
+The Mamba-3 MIMO inference kernels are vendored in `vllm/model_executor/layers/mamba/ops/mamba3/`
+(forward only, next to the Mamba-2 ops): **`mamba_ssm` is not needed**. They use `tilelang`,
+`nvidia-cutlass-dsl` and `quack-kernels`, already in vLLM's CUDA requirements.
+
+### Docker image
+
+The fork changes no `csrc/`, so the image reuses the precompiled upstream binaries of its base commit:
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile --target vllm-openai \
+  --build-arg VLLM_USE_PRECOMPILED=1 \
+  --build-arg VLLM_MERGE_BASE_COMMIT=568afb3a13806beb53bb2e6bd518269357b237c0 \
+  --build-arg VLLM_VERSION_OVERRIDE=0.26.0 \
+  --build-arg RUN_WHEEL_CHECK=false \
+  -t olala-vllm:dragon-v0.26 .
+
+docker run --rm --gpus all --ipc=host -p 8000:8000 \
+  -v /path/to/checkpoint:/model:ro -v olala-jit:/root/.cache \
+  olala-vllm:dragon-v0.26 /model --trust-remote-code --served-model-name olala
+```
+
+The TPA-factor decode and Mamba-3 step CUDA extensions are JIT-built (nvcc, sm_90) on first use;
+the `olala-jit` volume keeps them across container restarts.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

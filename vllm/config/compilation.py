@@ -770,6 +770,8 @@ class CompilationConfig:
         "vllm::unified_mla_attention_with_output",
         "vllm::mamba_mixer2",
         "vllm::mamba_mixer",
+        "vllm::olala_mamba3",
+        "vllm::olala_diff_tpa",
         "vllm::short_conv",
         # Qwen4Exp's AMD backend still uses these splitting ops.
         "vllm::qwen4_exp_ple_short_conv",

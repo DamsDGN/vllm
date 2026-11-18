@@ -28,7 +28,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
     weight_amax,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 
 class Int8OnlineMoEMethod(OnlineMoEMethodBase):
@@ -141,3 +141,56 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
             w2_bias=getattr(layer, "w2_bias", None),
             layer=layer,
         )
+
+
+class Int8SerializedMoEMethod(Int8OnlineMoEMethod):
+    """Per-channel INT8 MoE weights read from the checkpoint: int8
+    ``w13_weight``/``w2_weight`` and fp32 ``w13_scale``/``w2_scale``, exactly
+    what Int8OnlineMoEMethod computes from the bf16 weights at load time.
+    """
+
+    uses_meta_device: bool = False
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        if self.moe.has_bias:
+            raise NotImplementedError("serialized experts_int8 with expert biases")
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+        w13_rows = (
+            2 if self.moe.is_act_and_mul else 1
+        ) * intermediate_size_per_partition
+        shapes = {
+            "w13_weight": (num_experts, w13_rows, hidden_size),
+            "w2_weight": (num_experts, hidden_size, intermediate_size_per_partition),
+        }
+        for name, shape in shapes.items():
+            param = torch.nn.Parameter(
+                torch.empty(shape, dtype=torch.int8), requires_grad=False
+            )
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+        for name, rows in (("w13_scale", w13_rows), ("w2_scale", hidden_size)):
+            param = torch.nn.Parameter(
+                torch.empty(num_experts, rows, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter(name, param)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        self._setup_kernel(layer)
+
+        layer._already_called_process_weights_after_loading = True

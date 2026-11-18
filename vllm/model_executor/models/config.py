@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import os
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -1208,7 +1209,159 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
+    """Reconcile Olala's HF config with vLLM's hybrid-model assumptions."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+
+        # Olala's config reports num_key_value_heads=0, which makes the
+        # hybrid attention/mamba page-size alignment mis-size the KV cache.
+        # The real DiffTPA value is the noise-head count.
+        num_signal = getattr(hf_config, "num_signal_heads_diff", 0) or (
+            hf_config.num_attention_heads // 2
+        )
+        num_kv_heads = hf_config.num_attention_heads - num_signal
+        hf_config.num_key_value_heads = num_kv_heads
+        model_config.model_arch_config.total_num_kv_heads = num_kv_heads
+        logger.info(
+            "Olala: setting num_key_value_heads=%d (num_attention_heads - "
+            "num_signal_heads_diff)",
+            num_kv_heads,
+        )
+
+        # Surface the expert count under vLLM's canonical name so
+        # --enable-expert-parallel and the is_moe checks work.
+        if getattr(hf_config, "moe", False):
+            num_experts = int(getattr(hf_config, "moe_num_routed_experts", 0) or 0)
+            if num_experts > 0:
+                hf_config.num_experts = num_experts
+                model_config.model_arch_config.num_experts = num_experts
+
+        # Align mode pages mamba state for prefix caching and assumes every
+        # mamba layer exposes the same number of state tensors. Olala's M
+        # layers hold four and its V layers two, so reject it explicitly
+        # rather than fail later inside the state-copy machinery.
+        if vllm_config.cache_config.mamba_cache_mode == "align":
+            raise ValueError(
+                "Olala does not support --mamba-cache-mode align: its M and "
+                "V layers hold different numbers of recurrent state tensors."
+            )
+        # No Mamba prefix-caching mode works for Olala ("all" needs block-aligned
+        # state outputs, "align" is rejected above), and vLLM >= 0.33 enables
+        # prefix caching by default for hybrid models, then asserts chunked
+        # prefill, which Olala keeps off. Turn it off before the hybrid hook.
+        if vllm_config.cache_config.enable_prefix_caching:
+            vllm_config.cache_config.enable_prefix_caching = False
+            logger.info("Olala: prefix caching disabled (not supported).")
+
+        # Chunked prefill (continuation chunks run in the packed varlen call
+        # with Input_States, verified bit-stable) follows vLLM's
+        # --enable-chunked-prefill, on by default: it bounds the TTFT of long
+        # prompts and the decode stalls behind them. --no-enable-chunked-prefill
+        # keeps whole-prompt steps and the FULL-decode cudagraph regime, which
+        # measured higher throughput under concurrency on short prompts
+        # (128+512 c=128 on GH200: 9,198 vs 5,509 tok/s chunked).
+        scheduler_config = vllm_config.scheduler_config
+        if os.environ.get("OLALA_CHUNKED_PREFILL") is not None:
+            logger.warning(
+                "Olala: OLALA_CHUNKED_PREFILL is no longer read; chunked "
+                "prefill follows --enable-chunked-prefill."
+            )
+        if scheduler_config is not None and scheduler_config.enable_chunked_prefill:
+            logger.info("Olala: chunked prefill enabled.")
+            OlalaForCausalLMConfig._prefill_cudagraph_sizes(vllm_config)
+        elif scheduler_config is not None:
+            OlalaForCausalLMConfig._decode_cudagraph_sizes(vllm_config)
+            scheduler_config.long_prefill_token_threshold = 0
+            # A whole prompt must fit in one batch.
+            max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+            if max_model_len > scheduler_config.max_num_batched_tokens:
+                scheduler_config.max_num_batched_tokens = max_model_len
+            logger.info(
+                "Olala: chunked prefill disabled (--no-enable-chunked-prefill). "
+                "max_num_batched_tokens=%d",
+                scheduler_config.max_num_batched_tokens,
+            )
+
+
+def _olala_graphs_cap() -> str:
+    """Default prefill graph cap: 32768 tokens on >= 80 GB GPUs, 4096 below (the graphs up to a 32k budget take
+    ~2.9 GiB, taken from the KV / state budget: ~15 % of a 20 GB card)."""
+    try:
+        from vllm.platforms import current_platform
+
+        return "32768" if current_platform.get_device_total_memory() >= 80 * 1024**3 else "4096"
+    except Exception:  # noqa: BLE001 - no device query available: keep the small cap
+        return "4096"
+
+
+def _olala_prefill_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
+    """Piecewise CUDA graphs up to the chunked-prefill budget.
+
+    A prefill step is CPU-bound without graphs: the layers between the opaque Mamba / DiffTPA ops
+    (norms, MoE, geodesic, residuals) cost more host time than GPU time. Capturing them for
+    prefill-sized batches is +22% prefill throughput at 2048-token chunks on H100. vLLM's default
+    stops at 512 tokens; Olala keeps those sizes and adds a coarse ladder up to the token budget
+    (padding <= ~25% up to 8k, a size every 4k above), unless the user set capture sizes.
+    OLALA_PREFILL_GRAPHS=0 disables, OLALA_PREFILL_GRAPHS_MAX caps the ladder (default 32768 on >= 80 GB GPUs,
+    4096 below). B300, budget 32k:
+    8k prefill-only 179k -> 208k tok/s vs a 4k cap (8k/1k mixed c=128 / 256 unchanged), +2.9 GiB of graphs.
+    """
+    cc = vllm_config.compilation_config
+    sc = vllm_config.scheduler_config
+    if os.environ.get("OLALA_PREFILL_GRAPHS", "1") == "0":
+        return
+    if cc.max_cudagraph_capture_size is not None or cc.cudagraph_capture_sizes is not None:
+        return
+    budget = min(int(sc.max_num_batched_tokens), int(os.environ.get("OLALA_PREFILL_GRAPHS_MAX", _olala_graphs_cap())))
+    if budget <= 512:
+        return
+    sizes = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
+    sizes += [n for n in (640, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192) if n < budget]
+    sizes += list(range(12288, budget, 4096))  # above 8k: a size every 4k (a mixed step pads <= 33%)
+    sizes.append(budget)
+    cc.cudagraph_capture_sizes = sorted(set(sizes))
+    cc.max_cudagraph_capture_size = budget
+    logger.info("Olala: piecewise CUDA graphs up to %d tokens (prefill chunks).", budget)
+
+
+def _olala_decode_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
+    """Full decode CUDA graphs up to max_num_seqs.
+
+    vLLM stops capturing at 512, so a larger decode batch runs without the full
+    graph: the opaque Mamba / DiffTPA ops and the layers between them launch
+    eagerly. On B300 with 1024 concurrent 1k/1k requests that is 8.6k tok/s, vs
+    20.9k with graphs up to 1024 (+28 s capture, +0.8 GiB). Skipped when the
+    user set capture sizes; OLALA_DECODE_GRAPHS_MAX caps it (default 2048).
+    """
+    cc = vllm_config.compilation_config
+    sc = vllm_config.scheduler_config
+    if cc.max_cudagraph_capture_size is not None:
+        return
+    if cc.cudagraph_capture_sizes is not None:
+        return
+    cap = int(os.environ.get("OLALA_DECODE_GRAPHS_MAX", "2048"))
+    target = min(int(sc.max_num_seqs), cap)
+    if target <= 512:
+        return
+    cc.max_cudagraph_capture_size = target
+    logger.info(
+        "Olala: full decode CUDA graphs up to %d requests (max_num_seqs).", target
+    )
+
+
+OlalaForCausalLMConfig._prefill_cudagraph_sizes = staticmethod(_olala_prefill_cudagraph_sizes)
+OlalaForCausalLMConfig._decode_cudagraph_sizes = staticmethod(
+    _olala_decode_cudagraph_sizes
+)
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
+    "OlalaForCausalLM": OlalaForCausalLMConfig,
+    "DragonForCausalLM": OlalaForCausalLMConfig,
     "AliceAIForCausalLM": AliceAIForCausalLMConfig,
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,

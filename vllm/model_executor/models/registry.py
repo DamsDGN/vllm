@@ -97,6 +97,8 @@ _TEXT_GENERATION_MODELS = {
         "DeepseekV32ForCausalLM",
     ),
     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
+    # Checkpoints converted before the Olala rename.
+    "DragonForCausalLM": ("olala", "OlalaForCausalLM"),
     "DomynEdgeForCausalLM": ("domyn_edge", "DomynEdgeForCausalLM"),
     "DoryForCausalLM": ("dory", "DoryForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
@@ -185,6 +187,7 @@ _TEXT_GENERATION_MODELS = {
     "NemotronForCausalLM": ("nemotron", "NemotronForCausalLM"),
     "NemotronHForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
     "NemotronHPuzzleForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
+    "OlalaForCausalLM": ("olala", "OlalaForCausalLM"),
     "MuseGlimmerForCausalLM": ("muse_glimmer", "MuseGlimmerForCausalLM"),
     "OlmoHybridForCausalLM": ("olmo_hybrid", "OlmoHybridForCausalLM"),
     "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
