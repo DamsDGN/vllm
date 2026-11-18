@@ -1627,8 +1627,6 @@ package_data = {
         "model_executor/layers/quantization/utils/configs/*.json",
         # Olala JIT CUDA sources (TPA factor decode, Mamba-3 step)
         "model_executor/layers/mamba/olala/csrc/*.cu",
-        # Olala per-GPU TPA factor split tables (tpa_factor.py silently falls back without them)
-        "model_executor/layers/mamba/olala/configs/*.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",

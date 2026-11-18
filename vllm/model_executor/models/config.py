@@ -1240,6 +1240,13 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
                 hf_config.num_experts = num_experts
                 model_config.model_arch_config.num_experts = num_experts
 
+        from vllm.model_executor.layers.mamba.olala.mamba3 import keep_heads_spec
+
+        keep = keep_heads_spec(hf_config)
+        hf_config.mamba_keep_heads = {str(k): v for k, v in keep.items()} or None
+        if keep:
+            logger.info("Olala: Mamba-3 layers running a subset of heads: %s", keep)
+
         # Align mode pages mamba state for prefix caching and assumes every
         # mamba layer exposes the same number of state tensors. Olala's M
         # layers hold four and its V layers two, so reject it explicitly

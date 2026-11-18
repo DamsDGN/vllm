@@ -1411,6 +1411,8 @@ class OlalaForCausalLM(
             if handled:
                 continue
 
+            if name.startswith("model.layers.") and ".mixer" in name:
+                loaded_weight = self._slice_kept_heads(name, loaded_weight)
             if name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1429,7 +1431,109 @@ class OlalaForCausalLM(
         for module in self.modules():
             if isinstance(module, (OlalaMamba3Mixer, OlalaDiffTPAAttention, OlalaLatentMoE)):
                 module.refresh_weight_caches()
+        self._maybe_dense_int8()
         return loaded
+
+    def _maybe_dense_int8(self) -> None:
+        """OLALA_DENSE_INT8=row|g128: int8 W8A16 dense projections (activations stay bf16).
+
+        Every dense bf16 weight except the router and the embedding (and lm_head when
+        OLALA_DENSE_INT8_LMHEAD=0; only blocks in OLALA_DENSE_INT8_LAYERS, e.g. "24-35" or
+        "0,5,24-35", when set) is replaced by its dequantized int8 values, so the prefill
+        GEMMs compute what the int8 decode kernels do; the decode caches are built now and
+        decode_gemv reads int8 copies of them (+ mixer_proj, gate_proj, lm_head).
+        """
+        import re
+
+        from vllm.model_executor.layers.mamba.olala import decode_gemv as dg
+
+        if dg._Q8_GROUP is None:
+            return
+        group = dg._Q8_GROUP
+        with_lm = os.environ.get("OLALA_DENSE_INT8_LMHEAD", "1") == "1"
+        layers = None
+        raw = os.environ.get("OLALA_DENSE_INT8_LAYERS", "").replace(" ", "")
+        if raw:
+            layers = set()
+            for part in raw.split(","):
+                a, _, b = part.partition("-")
+                layers.update(range(int(a), int(b or a) + 1))
+        layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+        def in_layers(name: str) -> bool:
+            m = layer_re.search(name)
+            return layers is None or m is None or int(m.group(1)) in layers
+        moe_params = {
+            f"{n}.{pn}" for n, m in self.named_modules() if isinstance(m, OlalaLatentMoE)
+            for pn, _ in m.named_parameters()
+        }
+        quantized, direct = [], []
+        with torch.inference_mode():
+            for name, p in self.named_parameters():
+                if p.dim() != 2 or p.dtype != torch.bfloat16 or "embed" in name:
+                    continue
+                if re.search(r"(^|\.)gate\.weight$", name):  # router
+                    continue
+                if name.startswith("lm_head") and not with_lm:
+                    continue
+                if not in_layers(name):
+                    continue
+                dg.fake_quant_(p.data, group)
+                quantized.append(name)
+                if name not in moe_params:  # MoE projections reach decode via _small_w only
+                    direct.append(name)
+            for m in self.modules():
+                if isinstance(m, OlalaMamba3Mixer) and m._in_proj_cat_ok:
+                    m._in_proj_cat_weight()
+                elif (isinstance(m, OlalaDiffTPAAttention) and m._proj_concat_ok
+                      and os.environ.get("OLALA_TPA_CONCAT", "1") != "0"):
+                    m._decode_proj_weight()
+                elif isinstance(m, OlalaLatentMoE) and m._fused_proj:
+                    m._small_path_weights()
+                if isinstance(m, (OlalaMamba3Mixer, OlalaDiffTPAAttention, OlalaLatentMoE)):
+                    m.refresh_weight_caches()
+            for mname, m in self.named_modules():  # buffers first: their row slices (params) reuse their rows
+                if not in_layers(mname + "."):
+                    continue
+                for attr in ("_in_proj_cat_w", "_decode_proj_w_padded", "_small_w"):
+                    v = getattr(m, attr, None)
+                    for t in v if isinstance(v, tuple) else (v,):
+                        if isinstance(t, torch.Tensor) and t.dim() == 2 and t.dtype == torch.bfloat16:
+                            dg.register_int8(t, group)
+            params = dict(self.named_parameters())
+            for name in direct:
+                dg.register_int8(params[name].data, group)
+        if with_lm:
+            base = self.lm_head.quant_method
+
+            class _Int8LMHead(type(base)):  # same class checks, decode rows through decode_gemv
+                def apply(self, layer, x, bias=None):
+                    if bias is None and x.dim() == 2 and x.shape[0] <= dg.SKINNY_MAX_M:
+                        return dg.decode_gemv(x, layer.weight)
+                    return super().apply(layer, x, bias)
+
+            base.__class__ = _Int8LMHead
+        q8_bytes = sum(q.numel() + s.numel() * 4 for q, s in {id(v[0]): v for v in dg._Q8.values()}.values()
+                       if q._base is None)
+        logger.info("OLALA_DENSE_INT8=%s (layers %s): %d dense weights quantized, %d int8 decode weights (%.2f GB)",
+                    os.environ.get("OLALA_DENSE_INT8"), raw or "all", len(quantized), len(dg._Q8), q8_bytes / 1e9)
+
+    def _slice_kept_heads(self, name: str, w: torch.Tensor) -> torch.Tensor:
+        """Checkpoint tensors of a Mamba-3 layer running a subset of its heads
+        (``mamba_keep_heads``) are cut to those heads."""
+        _, _, idx, tail = name.split(".", 3)
+        try:
+            layer = self.model.layers[int(idx)]
+        except (ValueError, IndexError):
+            return w
+        mixer = getattr(layer, "mixer", None)
+        if not isinstance(mixer, OlalaMamba3Mixer) or mixer.keep_heads is None:
+            return w
+        if tail == "mixer_proj.weight":
+            return mixer.slice_out_proj_weight(w)
+        if tail.startswith("mixer."):
+            return mixer.slice_checkpoint_weight(tail[len("mixer.") :], w)
+        return w
 
     def _maybe_prenormalize_embeddings(self) -> None:
         """Fold the nGPT embedding normalization into the table.

@@ -78,11 +78,12 @@ def _load():
 
 def cuda_step_supported(ssm_pool, k_pool, v_pool, angle_pool, B, C, angle, num_heads, head_dim, d_state, rank, num_angles) -> bool:
     return (
-        num_heads == 48 and head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
+        num_heads in (48, 1, 2) and head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
         and ssm_pool.dtype in (torch.float32, torch.bfloat16) and k_pool.dtype == torch.bfloat16 and v_pool.dtype == torch.bfloat16
         and angle_pool.dtype == torch.float32
         and B.dim() == 3 and B.stride(1) == d_state and B.stride(2) == 1 and (B.stride(0) * 2) % 16 == 0
         and C.stride() == B.stride() and angle.stride(1) == 1 and (angle.stride(0) * 2) % 16 == 0
+        and B.data_ptr() % 16 == 0 and C.data_ptr() % 16 == 0 and angle.data_ptr() % 16 == 0
     )
 
 

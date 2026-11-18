@@ -60,6 +60,7 @@ from vllm.model_executor.layers.mamba.olala.state import (
     replay_config,
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
@@ -107,6 +108,37 @@ _apply_rotary_qk_inference_fwd = None
 
 
 _PREFILL_INPROJ_CAT = os.environ.get("OLALA_PREFILL_INPROJ_CAT", "1") != "0"
+
+
+def keep_heads_spec(config) -> dict[int, list[int]]:
+    """Mamba-3 layers that run a subset of their SSM heads: ``{layer: heads}``.
+
+    Some Olala layers degenerated into a single integrator head whose output is
+    ~1e10-1e16 while its siblings stay O(0.1): adding the siblings is lost to
+    rounding, so running only that head reproduces the layer. Set per checkpoint
+    with ``config.mamba_keep_heads`` (``{"<layer>": [heads]}``, e.g. through
+    ``--hf-overrides``); ``OLALA_M3_KEEP_HEADS="1:23,7:26+1"`` overrides it and
+    ``OLALA_M3_KEEP_HEADS=none`` disables it. OlalaForCausalLMConfig writes the
+    resolved spec back into the HF config, which keys the compile cache.
+    """
+    env = os.environ.get("OLALA_M3_KEEP_HEADS")
+    if env is not None:
+        raw: dict = {}
+        if env.strip().lower() not in ("", "0", "none", "off"):
+            for item in env.split(","):
+                layer, heads = item.split(":")
+                raw[layer] = [int(h) for h in heads.split("+")]
+    else:
+        raw = getattr(config, "mamba_keep_heads", None) or {}
+    return {
+        int(layer): sorted({int(h) for h in ([v] if isinstance(v, int) else v)})
+        for layer, v in raw.items()
+    }
+
+
+def mamba_keep_heads(config, layer_idx: int) -> list[int] | None:
+    """Heads kept by Mamba-3 layer ``layer_idx``, or None for all of them."""
+    return keep_heads_spec(config).get(layer_idx)
 
 
 def _xz_strided_ok(dev) -> bool:
@@ -398,8 +430,27 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self.d_state = config.mamba_d_state
         self.headdim = config.mamba_headdim
         self.ngroups = config.mamba_ngroups
-        self.nheads = self.d_inner // self.headdim
+        # The state pools keep every head (all Mamba layers share one state
+        # spec); a layer running a subset of heads uses the first rows of each
+        # slot (see _head_views).
+        self.nheads_state = self.d_inner // self.headdim
+        self.keep_heads = mamba_keep_heads(config, extract_layer_index(prefix))
+        if self.keep_heads is not None:
+            if tp != 1 or getattr(config, "mamba3_postgate_norm", False):
+                raise ValueError(
+                    "mamba_keep_heads needs tensor_parallel_size == 1 and no "
+                    "post-gate norm (it normalizes over every head)."
+                )
+            if not all(0 <= h < self.nheads_state for h in self.keep_heads):
+                raise ValueError(
+                    f"mamba_keep_heads for {prefix}: {self.keep_heads} out of "
+                    f"range for {self.nheads_state} heads."
+                )
+        self.nheads = (
+            self.nheads_state if self.keep_heads is None else len(self.keep_heads)
+        )
         self.nheads_local = divide(self.nheads, tp)
+        self._pool_views: tuple | None = None
         self.rope_fraction = 0.5
         self.rotary_dim_divisor = 4
         self.A_floor = 1e-4
@@ -415,7 +466,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # therefore yields a clean per-head shard.
         self.in_proj = ColumnParallelLinear(
             input_size=self.d_model,
-            output_size=self.d_inner * 2 + 3 * self.nheads,
+            output_size=self.nheads * (2 * self.headdim + 3),
             bias=False,
             gather_output=False,
             prefix=f"{prefix}.in_proj",
@@ -574,12 +625,45 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         return mamba3_state_shape(
             tp_world_size=self.tp_size,
-            num_heads=self.nheads,
+            num_heads=self.nheads_state,
             head_dim=self.headdim,
             d_state=self.d_state,
             mimo_dim=self.mimo_dim,
             num_rope_angles=self.num_rope_angles,
         )
+
+    def _head_views(self, pools: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        """Pools seen with ``nheads`` heads per slot: the first rows of each
+        slot's (full-size) angle / ssm / k / v state."""
+        if self.keep_heads is None:
+            return pools
+        key = tuple(p.data_ptr() for p in pools)
+        if self._pool_views is None or self._pool_views[0] != key:
+            angle, ssm, k, v = pools
+            H, R, S = self.nheads_local, k.shape[1], k.shape[3]
+            k = k.as_strided((k.shape[0], R, H, S), (k.stride(0), H * S, S, 1))
+            self._pool_views = (key, (angle[:, :H], ssm[:, :H], k, v[:, :H]))
+        return self._pool_views[1]
+
+    def slice_checkpoint_weight(self, name: str, w: torch.Tensor) -> torch.Tensor:
+        """Kept-head slice of a full-width checkpoint tensor of this mixer
+        (``name`` relative to the mixer); other tensors pass through."""
+        if self.keep_heads is None:
+            return w
+        idx = torch.tensor(self.keep_heads, device=w.device)
+        if name == "in_proj.weight":
+            return w.view(self.nheads_state, -1, w.shape[-1])[idx].flatten(0, 1)
+        if name in ("B_bias", "C_bias", "in_proj_mimo_x", "in_proj_mimo_z",
+                    "out_proj_mimo", "dt_bias", "D"):
+            return w[idx]
+        return w
+
+    def slice_out_proj_weight(self, w: torch.Tensor) -> torch.Tensor:
+        """Kept-head input columns of the block's mixer_proj weight."""
+        if self.keep_heads is None:
+            return w
+        idx = torch.tensor(self.keep_heads, device=w.device)
+        return w.view(w.shape[0], self.nheads_state, -1)[:, idx].flatten(1)
 
     # -- Forward ------------------------------------------------------------
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -642,12 +726,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                     hidden_states, g, self._pre_geo, self._in_proj_cat_weight(),
                     h_out, hidden_states.dtype,
                 )
-                n1 = self.in_proj.weight.shape[0]
+                n1, o2, n2 = self._in_proj_cat_layout()
                 ndt = md.num_decode_tokens
                 self._decode_raw_step(
                     None, out[:ndt], md.state_indices_tensor[: md.num_decodes],
                     tuple(self.kv_cache[:4]),
-                    zxdt_bc=(cat[:ndt, :n1], cat[:ndt, n1:]),
+                    zxdt_bc=(cat[:ndt, :n1], cat[:ndt, o2 : o2 + n2]),
                 )
                 return
             self._pre_geo(hidden_states, g, out=h_out)
@@ -661,7 +745,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
         all_pools = self.kv_cache
-        pools = tuple(all_pools[:4])  # (angle, ssm, k, v); ReplaySSM tensors follow
+        # (angle, ssm, k, v), seen with the kept heads; ReplaySSM tensors follow
+        pools = self._head_views(tuple(all_pools[:4]))
         slots = md.state_indices_tensor
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
@@ -716,16 +801,19 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if self._in_proj_cat_ok:
             w = self._in_proj_cat_weight()
             out = decode_gemv(u, w)
-            n1 = self.in_proj.weight.shape[0]
-            return out[:, :n1], out[:, n1:]
+            n1, o2, n2 = self._in_proj_cat_layout()
+            return out[:, :n1], out[:, o2 : o2 + n2]
         zxdt, _ = self.in_proj(u)
         bc, _ = self.in_proj_dyn(u)
         return zxdt, bc
 
     def _in_proj_cat_weight(self) -> torch.Tensor:
         if self._in_proj_cat_w is None:
+            # 8-row alignment keeps the B/C/angle columns 16-byte aligned (the
+            # CUDA step reads the angles in place) when a layer keeps few heads;
+            # a no-op at 48 heads (6288 + 1056 rows).
             self._in_proj_cat_w = cat_rows_shared(
-                [self.in_proj.weight, self.in_proj_dyn.weight]
+                [self.in_proj.weight, self.in_proj_dyn.weight], pad_to=8, align=8
             )
         return self._in_proj_cat_w
 
@@ -739,6 +827,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             and type(self.in_proj_dyn.quant_method).__name__ == "UnquantizedLinearMethod"
             and w.dtype == torch.bfloat16 and wd.dtype == torch.bfloat16
             and not self._postgate_norm
+            and self.keep_heads is None
             and _scan_tc_ok(dev)
         )
 
@@ -754,6 +843,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if self._pf_in_w is None:
             self._pf_in_w = torch.cat([self.in_proj.weight[self._pf_in_rows()], self.in_proj_dyn.weight]).contiguous()
         return self._pf_in_w
+
+    def _in_proj_cat_layout(self) -> tuple[int, int, int]:
+        """(in_proj rows, in_proj_dyn row offset, in_proj_dyn rows) in the
+        concatenated weight."""
+        n1, n2 = self.in_proj.weight.shape[0], self.in_proj_dyn.weight.shape[0]
+        return n1, -(-n1 // 8) * 8, n2
 
     def _project_in(self, h: torch.Tensor):
         """Run in_proj/in_proj_dyn on ``(N, D)`` and unpack the pieces."""
@@ -838,10 +933,10 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if n == 0 or torch.cuda.is_current_stream_capturing():
             out.zero_()
             return
-        pools = tuple(
+        pools = self._head_views(tuple(
             torch.zeros((1, *shape), dtype=dtype, device=h.device)
             for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
-        )[:4]
+        )[:4])
         slots = torch.zeros(1, dtype=torch.long, device=h.device)
         qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
         self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
@@ -1005,9 +1100,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 # one GEMM on [in_proj ; in_proj_dyn] (the decode weight cache): the narrow
                 # in_proj_dyn (1056 rows) alone fills 1.3 waves on 56 SMs; the prologue reads
                 # both outputs through their row strides
-                n1, n2 = self.in_proj.weight.shape[0], self.in_proj_dyn.weight.shape[0]
+                n1, o2, n2 = self._in_proj_cat_layout()
                 y = F.linear(h, self._in_proj_cat_weight())
-                zxdt, bc = y[:, :n1], y[:, n1 : n1 + n2]
+                zxdt, bc = y[:, :n1], y[:, o2 : o2 + n2]
             else:
                 zxdt, _ = self.in_proj(h)
                 bc, _ = self.in_proj_dyn(h)
@@ -1121,9 +1216,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 pw2[n1:].copy_(self.in_proj_dyn.weight)
             w = self._in_proj_cat_w
             if w is not None:
-                n1 = self.in_proj.weight.shape[0]
+                n1, o2, n2 = self._in_proj_cat_layout()
                 w[:n1].copy_(self.in_proj.weight)
-                w[n1:].copy_(self.in_proj_dyn.weight)
+                w[o2 : o2 + n2].copy_(self.in_proj_dyn.weight)
 
     def _decode_const_weights(self):
         """Rearranged constant weights for the decode-step kernels.
@@ -1333,7 +1428,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 "CUDA Mamba-3 decode step not applicable",
                 f"shapes/dtypes outside the kernel (H={H} D={D} S={S} R={R} "
                 f"angles={self.num_rope_angles}, B {B.dtype}, ssm pool "
-                f"{ssm_pool.dtype}); it implements H=48 D=64 S=128 R=4 angles=32",
+                f"{ssm_pool.dtype}); it implements H in (48, 1, 2) D=64 S=128 R=4 angles=32",
                 "CuteDSL decode step: ~1.4x slower Mamba-3 decode step",
                 "none needed for correctness; the kernel only covers the Olala 7A1B shapes",
             )

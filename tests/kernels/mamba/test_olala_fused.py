@@ -283,3 +283,81 @@ def test_decode_gemv_skinny_parity(m: int, n: int, k: int):
     out = decode_gemv(x, w)
     assert out.shape == (m, n) and out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0),
+    reason="CUDA Mamba-3 step needs sm_80+",
+)
+@pytest.mark.parametrize("keep", [[23], [26, 1]])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_cuda_step_kept_heads_match_full(keep: list[int], state_dtype: torch.dtype):
+    """A degenerate layer running only ``keep`` (mamba_keep_heads) steps those
+    heads bit-exactly like the 48-head kernel, on full-size pool slots seen
+    through the layer's head views."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.olala.mamba3 import OlalaMamba3Mixer
+    from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
+        mamba3_step_cuda,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    Bs, pool, NA = 9, 12, 32
+    k = torch.tensor(keep, device="cuda")
+
+    def rn(*s):
+        return torch.randn(*s, device="cuda", generator=g)
+
+    full = dict(
+        ang=rn(pool, H, NA),
+        ssm=rn(pool, H, D, S).to(state_dtype),
+        kp=rn(pool, R, H, S).bfloat16(),
+        vp=rn(pool, H, D).bfloat16(),
+    )
+    a = -torch.rand(Bs, H, device="cuda", generator=g) - 0.1
+    b, c = rn(Bs, R, S).bfloat16(), rn(Bs, R, S).bfloat16()
+    d, x = rn(H), rn(Bs, H, D).bfloat16()
+    dt = torch.rand(Bs, H, device="cuda", generator=g)
+    trap = torch.rand(Bs, H, device="cuda", generator=g)
+    xpj, opj, zpj, z = rn(R, H, D), rn(R, H, D), rn(R, H, D), rn(Bs, H, D).bfloat16()
+    bq, bk, angp = rn(R, H, S), rn(R, H, S), rn(Bs, NA).bfloat16()
+    slots = torch.randperm(pool, device="cuda", generator=g)[:Bs].to(torch.int32)
+
+    ref = {n: t.clone() for n, t in full.items()}
+    y_ref = torch.empty(Bs, H, D, device="cuda", dtype=torch.bfloat16)
+    mamba3_step_cuda(
+        ref["ssm"], ref["kp"], ref["vp"], ref["ang"], a, b, c, d, x, dt, trap,
+        xpj, zpj, opj, z, bq, bk, angp, slots, y_ref,
+    )  # fmt: skip
+
+    # Kept-head pools: the full-size layout, kept heads' state in the first rows.
+    nk = len(keep)
+    layer = SimpleNamespace(keep_heads=keep, nheads_local=nk, _pool_views=None)
+    raw = tuple(torch.zeros_like(full[n]) for n in ("ang", "ssm", "kp", "vp"))
+    ang_v, ssm_v, kp_v, vp_v = OlalaMamba3Mixer._head_views(layer, raw)
+    ang_v.copy_(full["ang"][:, k])
+    ssm_v.copy_(full["ssm"][:, k])
+    kp_v.copy_(full["kp"][:, :, k])
+    vp_v.copy_(full["vp"][:, k])
+
+    def sel(t, dim):
+        return t.index_select(dim, k).contiguous()
+
+    y = torch.empty(Bs, nk, D, device="cuda", dtype=torch.bfloat16)
+    mamba3_step_cuda(
+        ssm_v, kp_v, vp_v, ang_v, sel(a, 1), b, c, sel(d, 0), sel(x, 1),
+        sel(dt, 1), sel(trap, 1), sel(xpj, 1), sel(zpj, 1), sel(opj, 1),
+        sel(z, 1), sel(bq, 1), sel(bk, 1), angp, slots, y,
+    )  # fmt: skip
+    assert torch.equal(y, y_ref[:, k])
+    assert torch.equal(ssm_v, ref["ssm"][:, k])
+    assert torch.equal(kp_v, ref["kp"][:, :, k])
+    assert torch.equal(vp_v, ref["vp"][:, k])
+    assert torch.equal(ang_v, ref["ang"][:, k])
+    # Rows past the kept heads of each slot are never touched.
+    n_used = {"ang": nk * NA, "ssm": nk * D * S, "kp": R * nk * S, "vp": nk * D}
+    for t, n in zip(raw, ("ang", "ssm", "kp", "vp")):
+        assert not t.flatten(1)[:, n_used[n]:].any()

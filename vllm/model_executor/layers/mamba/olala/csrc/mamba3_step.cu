@@ -11,9 +11,11 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <type_traits>
 
 namespace {
-constexpr int H = 48, D = 64, S = 128, R = 4, NA = 32;
+// H (heads per token row) is a template parameter: 48, or the few heads a degenerate layer keeps
+constexpr int D = 64, S = 128, R = 4, NA = 32;
 #ifndef STEP_NST
 #define STEP_NST 2
 #endif
@@ -71,7 +73,7 @@ struct Args {
   int pdl;   // launched with programmatic stream serialization: wait for the producer grid before reading its output
 };
 
-template <bool F32> __device__ __forceinline__ void issue_item(const Args& a, Stage<F32>& st, int item, int t) {
+template <int H, bool F32> __device__ __forceinline__ void issue_item(const Args& a, Stage<F32>& st, int item, int t) {
   const int h = item % H, b = item / H;
   const int slot = a.slots[b]; const int srow = (slot >= 0 && slot < a.P) ? slot : 0;
   if constexpr (F32) {   // state 32 KB = 2048 x 16B -> 16 per thread
@@ -108,7 +110,7 @@ template <bool F32> __device__ __forceinline__ void issue_item(const Args& a, St
 #ifndef STEP_MINB
 #define STEP_MINB 4
 #endif
-template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(const Args a) {
+template <int H, bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(const Args a) {
   extern __shared__ __align__(128) char smem_raw[];
   Smem<F32>& S_ = *reinterpret_cast<Smem<F32>*>(smem_raw);
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -130,10 +132,10 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
   const int nk = (a.B - b0 + nb_stride - 1) / nb_stride;                 // items of this CTA
   if (b0 >= a.B) return;
 #pragma unroll
-  for (int s = 0; s < kStages<F32> - 1; ++s) { if (s < nk) issue_item(a, S_.st[s], item_of(s), t); cp_commit(); }
+  for (int s = 0; s < kStages<F32> - 1; ++s) { if (s < nk) issue_item<H>(a, S_.st[s], item_of(s), t); cp_commit(); }
   for (int k = 0; k < nk; ++k) {
     const int item = item_of(k);
-    { const int pf = k + kStages<F32> - 1; if (pf < nk) issue_item(a, S_.st[pf % kStages<F32>], item_of(pf), t); cp_commit(); }
+    { const int pf = k + kStages<F32> - 1; if (pf < nk) issue_item<H>(a, S_.st[pf % kStages<F32>], item_of(pf), t); cp_commit(); }
     const int b = item / H;
     const int slot = a.slots[b]; const bool valid = slot >= 0 && slot < a.P;
     float dt, A, trap;
@@ -442,6 +444,7 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
 // which frees the smem tile at once: the next item's state is prefetched while this item computes, the small token
 // rows are double-buffered, and h_new goes straight from the accumulators to the pool (full 32 B sectors per row
 // segment), with no smem round trip and no store loop. Same math, same order: bit-identical to the kernel above.
+constexpr int H = 48;       // the pipelined kernel runs full layers only (the 1-stage kernel takes H as a template parameter)
 constexpr int LDP = S + 8;   // padded fp32 tile row (conflict-free float2 fragment reads); 4 CTAs/SM still fit
 struct __align__(128) SmallStage {
   __nv_bfloat16 bst[R * S];   // previous B' (k_pool)
@@ -640,12 +643,17 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   a.bc_bstride = Bm.stride(0); a.angp_stride = angle_proj.stride(0);
   a.ssm_sst = ssm_pool.stride(0); a.kp_sst = k_pool.stride(0); a.vp_sst = v_pool.stride(0); a.ang_sst = angle_pool.stride(0);
   TORCH_CHECK(ssm_pool.stride(1) == D * S && ssm_pool.stride(2) == S && ssm_pool.stride(3) == 1, "ssm_pool inner dims must be contiguous");
+  // heads per token row: x is (B, H, D), or in raw mode the head-interleaved in_proj rows (B, H * (2D + 3))
+  const int H = raw_zxdt.has_value() ? (int)(raw_zxdt->size(1) / (2 * D + 3)) : (int)x.size(1);
+  TORCH_CHECK(H == 48 || H == 1 || H == 2, "mamba3 step: unsupported head count ", H);
   TORCH_CHECK(k_pool.stride(1) == H * S && k_pool.stride(2) == S && k_pool.stride(3) == 1, "k_pool inner dims must be contiguous");
   TORCH_CHECK(v_pool.stride(1) == D && v_pool.stride(2) == 1 && angle_pool.stride(1) == NA && angle_pool.stride(2) == 1);
   const bool f32 = ssm_pool.dtype() == torch::kFloat32;
   TORCH_CHECK((a.ssm_sst * ssm_pool.element_size()) % 16 == 0 && (a.kp_sst * 2) % 16 == 0 && (a.vp_sst * 2) % 16 == 0 && (a.ang_sst * 4) % 16 == 0, "pool slot strides must be 16B aligned");
   TORCH_CHECK(Bm.stride(1) == S && Bm.stride(2) == 1 && Cm.stride(0) == Bm.stride(0) && Cm.stride(1) == S && angle_proj.stride(1) == 1);
   TORCH_CHECK((Bm.stride(0) * 2) % 16 == 0 && (angle_proj.stride(0) * 2) % 16 == 0, "B/C batch stride and angle_proj row stride must be 16B aligned");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(Bm.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(Cm.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(angle_proj.data_ptr()) % 16 == 0, "B/C and angle_proj must start 16B aligned (cp.async)");
   TORCH_CHECK((f32 || ssm_pool.dtype() == torch::kBFloat16) && k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
   a.pdl = pdl ? 1 : 0;
   a.raw = 0; a.zxdt = nullptr; a.zxdt_stride = 0; a.dt_bias = nullptr; a.a_floor = 0.f; a.wb = a.wc = nullptr; a.eps = 0.f;
@@ -658,7 +666,7 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   }
   auto launch = [&](auto kernel, int smem) {
     // once per kernel (the pipelined and 1-stage fp32 kernels share F32)
-    static const void* done[4] = {}; bool seen = false;
+    static const void* done[8] = {}; bool seen = false;
     for (auto& d : done) { if (d == (const void*)kernel) { seen = true; break; } if (!d) { d = (const void*)kernel; break; } }
     if (!seen) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int nsm = 132; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
@@ -676,10 +684,17 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
       kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
     }
   };
-  // fp32 state, preamble done upstream: the pipelined kernel (OLALA_STEP_PIPE=0 keeps the 1-stage one)
+  // fp32 state, preamble done upstream: the pipelined kernel (OLALA_STEP_PIPE=0 keeps the 1-stage one).
+  // Layers running a subset of their heads (mamba_keep_heads: H = 1 or 2) take the 1-stage kernel.
   static const bool pipe = [] { const char* e = getenv("OLALA_STEP_PIPE"); return !(e && e[0] == '0'); }();
-  if (f32 && !a.raw && pipe) launch(mamba3_step_f32_pipe_kernel, (int)sizeof(SmemP));
-  else if (f32) launch(mamba3_step_cuda_kernel<true>, (int)sizeof(Smem<true>));
-  else launch(mamba3_step_cuda_kernel<false>, (int)sizeof(Smem<false>));
+  auto run = [&](auto h) {
+    constexpr int NH = decltype(h)::value;
+    if (f32) launch(mamba3_step_cuda_kernel<NH, true>, (int)sizeof(Smem<true>));
+    else launch(mamba3_step_cuda_kernel<NH, false>, (int)sizeof(Smem<false>));
+  };
+  if (H == 48 && f32 && !a.raw && pipe) launch(mamba3_step_f32_pipe_kernel, (int)sizeof(SmemP));
+  else if (H == 48) run(std::integral_constant<int, 48>{});
+  else if (H == 1) run(std::integral_constant<int, 1>{});
+  else run(std::integral_constant<int, 2>{});
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_step_cuda, py::arg("ssm"), py::arg("kp"), py::arg("vp"), py::arg("angle"), py::arg("A"), py::arg("Bm"), py::arg("Cm"), py::arg("Dp"), py::arg("x"), py::arg("dt"), py::arg("trap"), py::arg("xproj"), py::arg("zproj"), py::arg("outproj"), py::arg("z"), py::arg("bias_q"), py::arg("bias_k"), py::arg("angle_proj"), py::arg("slots"), py::arg("y"), py::arg("ctas_per_sm"), py::arg("raw_zxdt") = py::none(), py::arg("raw_dt_bias") = py::none(), py::arg("a_floor") = 0.0, py::arg("raw_wb") = py::none(), py::arg("raw_wc") = py::none(), py::arg("eps") = 0.0, py::arg("pdl") = false); }
