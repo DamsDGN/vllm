@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Single-token GEMV for Olala's decode projections.
+
+cuBLAS's batch-1 kernels sit on a ~4.2 us floor whatever the matrix size,
+so the many small projections of a decode step (latent MoE, in_proj_dyn,
+TPA factors) run at well under 1 TB/s. This streaming kernel — each program
+owns BN output rows and walks K in BK chunks — is 2.5-3 us on those shapes
+and also ahead of cuBLAS on the large ones (measured under CUDA graphs on
+GH200). For M > 1 the per-row loop re-reads the weight tile, so cuBLAS
+remains the better choice and ``decode_gemv`` falls back to F.linear.
+"""
+
+import os
+
+import torch
+import torch.nn.functional as F
+
+from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+_DISABLED = os.environ.get("OLALA_GEMV", "1") == "0"
+
+
+@triton.jit
+def _gemv_m1_kernel(
+    x_ptr, w_ptr, y_ptr, N, K, stride_wn,
+    BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    n_mask = offs_n < N
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        w = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+            mask=n_mask[:, None], other=0.0,
+        )
+        x = tl.load(x_ptr + offs_k)
+        acc += tl.sum(w.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)
+    tl.store(y_ptr + offs_n, acc.to(y_ptr.dtype.element_ty), mask=n_mask)
+
+
+def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` for ``x: (M, K)``, ``weight: (N, K)``; triton at M == 1."""
+    if x.shape[0] != 1 or not x.is_cuda or x.dtype != weight.dtype or _DISABLED:
+        return F.linear(x, weight)
+    N, K = weight.shape
+    if K % 128 != 0:
+        return F.linear(x, weight)
+    y = torch.empty(1, N, dtype=x.dtype, device=x.device)
+    # HBM-streaming configs measured on GH200 (36 distinct weights, graphed):
+    # wide outputs like 8 rows/program; narrow outputs want more programs.
+    if N >= 4096:
+        bn, bk, nw = 8, 512, 4
+    elif K % 1024 == 0 and K >= 3072:
+        bn, bk, nw = 4, 1024, 8
+    else:
+        bn, bk, nw = 4, (512 if K % 512 == 0 else 128), 8
+    _gemv_m1_kernel[(triton.cdiv(N, bn),)](
+        x, weight, y, N, K, weight.stride(0), BN=bn, BK=bk, num_warps=nw,
+    )
+    return y
+
+
+def _olala_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return decode_gemv(x, weight)
+
+
+def _olala_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+
+
+# Opaque to torch.compile so the M == 1 dispatch is re-evaluated per cudagraph
+# capture instead of being specialized by the first (large) compile.
+direct_register_custom_op(
+    op_name="olala_linear",
+    op_func=_olala_linear,
+    mutates_args=[],
+    fake_impl=_olala_linear_fake,
+)
+
+
+def olala_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.ops.vllm.olala_linear(x, weight)
+
+
+def cat_rows_shared(params: list[torch.nn.Parameter], pad_to: int = 1) -> torch.Tensor:
+    """Row-concatenate ``params`` and rebind each one to its slice of the result.
+
+    The concatenated decode weight then costs no extra memory (a separate copy
+    is ~0.8 GB over the 36 layers, a fifth of the KV budget on a 20 GB GPU).
+    Row slices of a contiguous tensor keep the parameters' shapes and strides,
+    and in-place weight reloads (``param.data.copy_``) land in the shared
+    storage, so the concatenation never goes stale.
+
+    With ``pad_to`` > 1 the buffer gets zero rows up to a multiple of ``pad_to`` (the returned
+    tensor includes them): cuBLAS picks Hopper kernels only for aligned output widths.
+    """
+    with torch.no_grad():
+        n_rows = sum(p.shape[0] for p in params)
+        n_pad = -(-n_rows // pad_to) * pad_to
+        ref = params[0].data
+        w = torch.zeros(n_pad, *ref.shape[1:], dtype=ref.dtype, device=ref.device)
+        torch.cat([p.data for p in params], 0, out=w[:n_rows])
+        off = 0
+        for p in params:
+            n = p.shape[0]
+            p.data = w[off : off + n]
+            off += n
+    return w
