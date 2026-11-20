@@ -17,6 +17,10 @@ from vllm.v1.attention.backends.mamba2_attn import (
     Mamba2AttentionMetadata,
     Mamba2AttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.mamba3_attn import Mamba3AttentionMetadataBuilder
+from vllm.v1.attention.backends.olala_diff_tpa_attn import (
+    OlalaDiffTPAMetadataBuilder,
+)
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
     ShortConvAttentionMetadataBuilder,
@@ -55,7 +59,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
     ) -> dict[str, Any]:
-        if not isinstance(
+        is_olala = isinstance(
+            attn_metadata_builder,
+            (Mamba3AttentionMetadataBuilder, OlalaDiffTPAMetadataBuilder),
+        )
+        if not is_olala and not isinstance(
             attn_metadata_builder,
             (
                 Mamba2AttentionMetadataBuilder,
@@ -69,8 +77,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
+            # Olala's column-slot protocol needs last-step acceptance on every
+            # step, including no-draft ones: forcing None keeps the builder on
+            # the neutral value instead of reading a stale state column.
             "num_decode_draft_tokens_cpu": None
-            if self.num_decode_draft_tokens_cpu is None
+            if is_olala or self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
 
