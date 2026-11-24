@@ -687,7 +687,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             )
         # The fused kernel has no clamp parameter, so a configured
         # SwiGLU clamp limit falls through to the unfused path.
-        if use_sorted_a:
+        elif use_sorted_a:
             qintermediate_cache2 = intermediate_cache1.new_empty(
                 (num_sorted_rows, cache2_dim),
                 dtype=current_platform.fp8_dtype(),
